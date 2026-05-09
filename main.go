@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -115,13 +120,7 @@ func parseID(r *http.Request) (int64, error) {
 	return id, err
 }
 
-func main() {
-	s, err := newStore("app.db")
-	if err != nil {
-		log.Fatalf("store init: %v", err)
-	}
-	defer s.db.Close()
-
+func newRouter(s *store) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -222,7 +221,37 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	addr := ":8080"
-	log.Printf("listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	return mux
+}
+
+func main() {
+	s, err := newStore("app.db")
+	if err != nil {
+		log.Fatalf("store init: %v", err)
+	}
+	defer s.db.Close()
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: newRouter(s),
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
 }
