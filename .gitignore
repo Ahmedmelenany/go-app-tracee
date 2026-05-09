@@ -15,6 +15,12 @@ coverage.*
 go.work
 go.work.sum
 
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Env / secrets
 .env
 .env.local

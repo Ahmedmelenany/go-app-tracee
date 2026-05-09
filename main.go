@@ -1,73 +1,102 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
+
+	_ "modernc.org/sqlite"
 )
 
 type Item struct {
-	ID   int    `json:"id"`
+	ID   int64  `json:"id"`
 	Name string `json:"name"`
 }
 
 type store struct {
-	mu     sync.Mutex
-	items  map[int]Item
-	nextID int
+	db *sql.DB
 }
 
-func newStore() *store {
-	return &store{items: map[int]Item{}, nextID: 1}
+func newStore(path string) (*store, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL
+	)`); err != nil {
+		return nil, err
+	}
+	return &store{db: db}, nil
 }
 
-func (s *store) list() []Item {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]Item, 0, len(s.items))
-	for _, it := range s.items {
+func (s *store) list() ([]Item, error) {
+	rows, err := s.db.Query("SELECT id, name FROM items ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Item{}
+	for rows.Next() {
+		var it Item
+		if err := rows.Scan(&it.ID, &it.Name); err != nil {
+			return nil, err
+		}
 		out = append(out, it)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *store) get(id int) (Item, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	it, ok := s.items[id]
-	return it, ok
+func (s *store) get(id int64) (Item, error) {
+	var it Item
+	err := s.db.QueryRow("SELECT id, name FROM items WHERE id = ?", id).Scan(&it.ID, &it.Name)
+	return it, err
 }
 
-func (s *store) create(name string) Item {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	it := Item{ID: s.nextID, Name: name}
-	s.items[it.ID] = it
-	s.nextID++
-	return it
-}
-
-func (s *store) update(id int, name string) (Item, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.items[id]; !ok {
-		return Item{}, false
+func (s *store) create(name string) (Item, error) {
+	res, err := s.db.Exec("INSERT INTO items (name) VALUES (?)", name)
+	if err != nil {
+		return Item{}, err
 	}
-	it := Item{ID: id, Name: name}
-	s.items[id] = it
-	return it, true
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Item{}, err
+	}
+	return Item{ID: id, Name: name}, nil
 }
 
-func (s *store) delete(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.items[id]; !ok {
-		return false
+func (s *store) update(id int64, name string) (Item, error) {
+	res, err := s.db.Exec("UPDATE items SET name = ? WHERE id = ?", name, id)
+	if err != nil {
+		return Item{}, err
 	}
-	delete(s.items, id)
-	return true
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Item{}, err
+	}
+	if n == 0 {
+		return Item{}, sql.ErrNoRows
+	}
+	return Item{ID: id, Name: name}, nil
+}
+
+func (s *store) delete(id int64) error {
+	res, err := s.db.Exec("DELETE FROM items WHERE id = ?", id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -80,8 +109,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+func parseID(r *http.Request) (int64, error) {
+	var id int64
+	_, err := fmt.Sscanf(r.PathValue("id"), "%d", &id)
+	return id, err
+}
+
 func main() {
-	s := newStore()
+	s, err := newStore("app.db")
+	if err != nil {
+		log.Fatalf("store init: %v", err)
+	}
+	defer s.db.Close()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +129,12 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /items", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.list())
+		items, err := s.list()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	})
 
 	mux.HandleFunc("POST /items", func(w http.ResponseWriter, r *http.Request) {
@@ -104,26 +149,35 @@ func main() {
 			writeError(w, http.StatusBadRequest, "name is required")
 			return
 		}
-		writeJSON(w, http.StatusCreated, s.create(body.Name))
+		it, err := s.create(body.Name)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, it)
 	})
 
 	mux.HandleFunc("GET /items/{id}", func(w http.ResponseWriter, r *http.Request) {
-		var id int
-		if _, err := fmt.Sscanf(r.PathValue("id"), "%d", &id); err != nil {
+		id, err := parseID(r)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid id")
 			return
 		}
-		it, ok := s.get(id)
-		if !ok {
+		it, err := s.get(id)
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, it)
 	})
 
 	mux.HandleFunc("PUT /items/{id}", func(w http.ResponseWriter, r *http.Request) {
-		var id int
-		if _, err := fmt.Sscanf(r.PathValue("id"), "%d", &id); err != nil {
+		id, err := parseID(r)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid id")
 			return
 		}
@@ -138,22 +192,31 @@ func main() {
 			writeError(w, http.StatusBadRequest, "name is required")
 			return
 		}
-		it, ok := s.update(id, body.Name)
-		if !ok {
+		it, err := s.update(id, body.Name)
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, it)
 	})
 
 	mux.HandleFunc("DELETE /items/{id}", func(w http.ResponseWriter, r *http.Request) {
-		var id int
-		if _, err := fmt.Sscanf(r.PathValue("id"), "%d", &id); err != nil {
+		id, err := parseID(r)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid id")
 			return
 		}
-		if !s.delete(id) {
+		err = s.delete(id)
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
